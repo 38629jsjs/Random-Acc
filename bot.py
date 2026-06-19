@@ -433,7 +433,40 @@ CREATE INDEX IF NOT EXISTS idx_stock_product ON stock (product_code);
 CREATE INDEX IF NOT EXISTS idx_orders_user ON orders (user_id);
 CREATE INDEX IF NOT EXISTS idx_deposits_user ON deposits (user_id);
 
+-- Self-healing migration: if any of these tables already existed from an
+-- earlier version of this bot (with fewer columns), CREATE TABLE IF NOT
+-- EXISTS above does nothing - these ALTER statements patch any missing
+-- column on every boot instead, so the bot never crashes on a stale schema.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS language TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS balance NUMERIC(12,2) NOT NULL DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS discount_eligible BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+ALTER TABLE products ADD COLUMN IF NOT EXISTS name TEXT;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS description_en TEXT;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS description_km TEXT;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS price NUMERIC(12,2) NOT NULL DEFAULT 0;
+
+ALTER TABLE stock ADD COLUMN IF NOT EXISTS product_code TEXT;
+ALTER TABLE stock ADD COLUMN IF NOT EXISTS credentials TEXT;
+ALTER TABLE stock ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS user_id BIGINT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS product_code TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS price NUMERIC(12,2) NOT NULL DEFAULT 0;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS credentials TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+ALTER TABLE deposits ADD COLUMN IF NOT EXISTS user_id BIGINT;
+ALTER TABLE deposits ADD COLUMN IF NOT EXISTS amount NUMERIC(12,2) NOT NULL DEFAULT 0;
+ALTER TABLE deposits ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE deposits ADD COLUMN IF NOT EXISTS receipt_file_id TEXT;
+ALTER TABLE deposits ADD COLUMN IF NOT EXISTS receipt_text TEXT;
+ALTER TABLE deposits ADD COLUMN IF NOT EXISTS group_message_id BIGINT;
+ALTER TABLE deposits ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE deposits ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
 """
 
 
