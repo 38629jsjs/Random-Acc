@@ -166,6 +166,7 @@ logger = logging.getLogger("vinzy-bot")
 ASK_AMOUNT, ASK_RECEIPT = range(2)                 # Add Funds (customer)
 ASK_STOCK_PRODUCT, ASK_STOCK_DUMP = range(10, 12)  # /addstock (stock group)
 ASK_KHQR_PHOTO = 20                                # /khqr (stock group)
+FILE_ASK_QUANTITY, FILE_ASK_PRODUCT = range(30, 32)  # stock file upload (stock group)
 
 db_pool: Optional[asyncpg.Pool] = None
 
@@ -1395,6 +1396,147 @@ async def addstock_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data.pop("addstock_added", None)
     context.user_data.pop("addstock_product", None)
     await update.message.reply_text("❎ Stock drop cancelled.")
+    return ConversationHandler.END
+
+
+# ==============================================================================
+# Stock-group: file-upload stock import (drop a .txt instead of pasting text)
+# ==============================================================================
+# Same idea as /addstock, but for when you have the accounts saved as a
+# file instead of wanting to paste a huge block of text by hand. Send the
+# .txt straight into the stock group - the bot downloads it, counts how
+# many accounts it can find (using the same --- separated parser as
+# /addstock), then asks how many of them to actually add and to which
+# product before touching the database.
+async def handle_stock_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_chat.id != STOCK_GROUP_ID:
+        return ConversationHandler.END
+    if not await is_group_admin(context, STOCK_GROUP_ID, update.effective_user.id):
+        await update.message.reply_text("Only group admins can import stock files.")
+        return ConversationHandler.END
+
+    document = update.message.document
+    try:
+        tg_file = await document.get_file()
+        buf = BytesIO()
+        await tg_file.download_to_memory(out=buf)
+        buf.seek(0)
+        text = buf.read().decode("utf-8", errors="replace")
+    except Exception:
+        logger.exception("Failed to download/decode stock file %s", document.file_name)
+        await update.message.reply_text("⚠️ I couldn't read that file. Please make sure it's a plain .txt file and try again.")
+        return ConversationHandler.END
+
+    entries = parse_stock_dump(text)
+    if not entries:
+        await update.message.reply_text(
+            "⚠️ I couldn't find any accounts in that file. Make sure entries are separated "
+            "by a line of --- between each one."
+        )
+        return ConversationHandler.END
+
+    context.user_data["file_stock_entries"] = entries
+    await update.message.reply_text(
+        f"📄 Found {len(entries)} account(s) in '{document.file_name}'.\n\n"
+        f"How many do you want to add? Send a number (1-{len(entries)}), or 'all'.\n"
+        f"Send /cancel to abort."
+    )
+    return FILE_ASK_QUANTITY
+
+
+async def file_ask_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    entries = context.user_data.get("file_stock_entries", [])
+    if not entries:
+        await update.message.reply_text("⚠️ Something went wrong - please send the file again.")
+        return ConversationHandler.END
+
+    raw = update.message.text.strip().lower()
+    if raw == "all":
+        quantity = len(entries)
+    else:
+        try:
+            quantity = int(raw)
+        except ValueError:
+            await update.message.reply_text(f"⚠️ Send a number between 1 and {len(entries)}, or 'all'.")
+            return FILE_ASK_QUANTITY
+
+    if quantity < 1 or quantity > len(entries):
+        await update.message.reply_text(f"⚠️ Send a number between 1 and {len(entries)}, or 'all'.")
+        return FILE_ASK_QUANTITY
+
+    context.user_data["file_stock_quantity"] = quantity
+
+    async with db_pool.acquire() as conn:
+        products = await conn.fetch("SELECT code, name FROM products ORDER BY code")
+
+    if not products:
+        await update.message.reply_text("⚠️ No products exist yet. Use /addproduct first, then send the file again.")
+        context.user_data.pop("file_stock_entries", None)
+        context.user_data.pop("file_stock_quantity", None)
+        return ConversationHandler.END
+
+    if len(products) == 1:
+        return await _finish_file_import(update, context, products[0]["code"], products[0]["name"])
+
+    buttons = [[InlineKeyboardButton(p["name"], callback_data=f"fileprod_{p['code']}")] for p in products]
+    await update.message.reply_text("Which product is this stock for?", reply_markup=InlineKeyboardMarkup(buttons))
+    return FILE_ASK_PRODUCT
+
+
+async def file_pick_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    code = query.data.split("fileprod_", 1)[1]
+
+    async with db_pool.acquire() as conn:
+        product = await conn.fetchrow("SELECT name FROM products WHERE code = $1", code)
+    name = product["name"] if product else code
+
+    return await _finish_file_import(update, context, code, name, via_callback=True)
+
+
+async def _finish_file_import(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, code: str, name: str, via_callback: bool = False
+) -> int:
+    entries = context.user_data.get("file_stock_entries", [])
+    quantity = context.user_data.get("file_stock_quantity", len(entries))
+    batch = entries[:quantity]
+    leftover = len(entries) - len(batch)
+
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.executemany(
+                "INSERT INTO stock (product_code, credentials) VALUES ($1, $2)",
+                [(code, entry) for entry in batch],
+            )
+    except Exception:
+        logger.exception("Failed to import stock file batch for product %s", code)
+        text = "⚠️ Something went wrong saving that batch. Please try again."
+        if via_callback:
+            await update.callback_query.edit_message_text(text)
+        else:
+            await update.message.reply_text(text)
+        return ConversationHandler.END
+
+    in_stock = await get_stock_count(code)
+    summary = f"✅ Added {len(batch)} account(s) to '{name}'.\n📦 Now in stock: {in_stock}"
+    if leftover > 0:
+        summary += f"\n\nℹ️ {leftover} account(s) from the file were left over (not added). Send the file again to add the rest."
+
+    if via_callback:
+        await update.callback_query.edit_message_text(summary)
+    else:
+        await update.message.reply_text(summary)
+
+    context.user_data.pop("file_stock_entries", None)
+    context.user_data.pop("file_stock_quantity", None)
+    return ConversationHandler.END
+
+
+async def file_import_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("file_stock_entries", None)
+    context.user_data.pop("file_stock_quantity", None)
+    await update.message.reply_text("❎ File import cancelled. Nothing was added.")
     return ConversationHandler.END
 
 
