@@ -574,29 +574,47 @@ def parse_stock_dump(text: str) -> list[str]:
     """Split a pasted/uploaded block of accounts into individual raw
     entries, before any field extraction happens.
 
-    Accounts are expected to be separated by a line of three or more
-    dashes (---), matching how the shop owner already formats stock
-    drops, e.g.:
+    Different stock dumps use different conventions - some separate every
+    account with a line of three or more dashes (---), others just leave
+    a blank line and start the next numbered entry straight away:
 
-        1. email1:pass1
-           Level: 125
-        ---
-        2. email2:pass2
-           Level: 77
+        1. email1:pass1          2101. email1:pass1
+           Level: 125                Level: 125
+        ---                                          <- no dashes at all
+        2. email2:pass2          2102. email2:pass2
+           Level: 77                 Level: 77
 
-    Leading numbering like "1. " / "2. " on the first line of each block
-    is stripped automatically (the numbers in real dumps aren't even
-    sequential/unique, so they're never relied on for anything). Blank
-    blocks are ignored.
+    To handle both, the real split point is detected by finding every
+    line that *starts* a new account - optional numbering followed by
+    something that looks like "email:password" - and cutting right
+    before each one. Lines of dashes that happen to still be present
+    just get stripped out afterwards. Leading numbering like "1. " /
+    "2101. " is also stripped (the numbers in real dumps aren't even
+    sequential/unique, so they're never relied on for anything).
     """
-    blocks = re.split(r"\n?-{3,}\n?", text)
+    entry_start = re.compile(r"^[ \t]*(?:\d+\.\s*)?\S+@\S+:\S+", re.MULTILINE)
+    matches = list(entry_start.finditer(text))
+
+    if matches:
+        blocks = []
+        for i, match in enumerate(matches):
+            start = match.start()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            blocks.append(text[start:end])
+    else:
+        # No "email:password"-looking lines found at all - fall back to
+        # plain dash-separated splitting as a last resort.
+        blocks = re.split(r"\n?-{3,}\n?", text)
+
     entries = []
     for block in blocks:
         block = block.strip()
         if not block:
             continue
         block = re.sub(r"^\d+\.\s*", "", block, count=1)
-        entries.append(block)
+        block = re.sub(r"^-{3,}\s*$", "", block, flags=re.MULTILINE).strip()
+        if block:
+            entries.append(block)
     return entries
 
 
