@@ -39,11 +39,13 @@ HOW THE STORE WORKS (customer side)
 ------------------------------------------------------------------------------
 HOW THE STORE WORKS (stock group - admins only)
 ------------------------------------------------------------------------------
-    /addstock <quantity>     Start a stock drop. The bot then asks you to
-                             paste the accounts, separated by lines of
-                             "---" between each one (you can paste in
-                             multiple messages if it's long - send /done
-                             when finished).
+    /addstock                Start a stock drop. The bot asks which product
+                             (skipped if you only have one), then asks you
+                             to send a .txt file. It automatically pulls
+                             out the Gmail, Password, ID, Name, Level, Hero
+                             Count, Skin Count, Banned, V2L Status and
+                             Collector Title from each account, then asks
+                             how many to actually add.
     /setprice <code> <price>     Change a product's price
     /productprice <code> <price> Same thing, alias
     /addproduct <code> <price> <name...>   Create a brand new product
@@ -164,9 +166,8 @@ logger = logging.getLogger("vinzy-bot")
 
 # Conversation states.
 ASK_AMOUNT, ASK_RECEIPT = range(2)                 # Add Funds (customer)
-ASK_STOCK_PRODUCT, ASK_STOCK_DUMP = range(10, 12)  # /addstock (stock group)
+ASK_STOCK_PRODUCT, ASK_STOCK_FILE, ASK_STOCK_QUANTITY = range(10, 13)  # /addstock (stock group)
 ASK_KHQR_PHOTO = 20                                # /khqr (stock group)
-FILE_ASK_QUANTITY, FILE_ASK_PRODUCT = range(30, 32)  # stock file upload (stock group)
 
 db_pool: Optional[asyncpg.Pool] = None
 
@@ -569,7 +570,8 @@ def generate_fallback_qr(amount: Decimal) -> BytesIO:
 
 
 def parse_stock_dump(text: str) -> list[str]:
-    """Split a pasted block of accounts into individual stock entries.
+    """Split a pasted/uploaded block of accounts into individual raw
+    entries, before any field extraction happens.
 
     Accounts are expected to be separated by a line of three or more
     dashes (---), matching how the shop owner already formats stock
@@ -582,7 +584,9 @@ def parse_stock_dump(text: str) -> list[str]:
            Level: 77
 
     Leading numbering like "1. " / "2. " on the first line of each block
-    is stripped automatically. Whitespace-only blocks are ignored.
+    is stripped automatically (the numbers in real dumps aren't even
+    sequential/unique, so they're never relied on for anything). Blank
+    blocks are ignored.
     """
     blocks = re.split(r"\n?-{3,}\n?", text)
     entries = []
@@ -593,6 +597,45 @@ def parse_stock_dump(text: str) -> list[str]:
         block = re.sub(r"^\d+\.\s*", "", block, count=1)
         entries.append(block)
     return entries
+
+
+# The exact fields kept from each raw account dump, in display order.
+# Add or remove a (label, emoji) pair here any time the shop wants to
+# show different stats on a stock card - nothing else needs to change.
+SMART_FIELDS = [
+    ("ID", "🆔"),
+    ("Name", "📛"),
+    ("Level", "⭐"),
+    ("Hero Count", "🦸"),
+    ("Skin Count", "🎨"),
+    ("Banned", "🚫"),
+    ("V2L Status", "🔄"),
+    ("Collector Title", "🏆"),
+]
+
+
+def smart_extract_account(block: str) -> str:
+    """Pull just the fields buyers actually care about out of a raw,
+    stat-heavy account dump (the kind with 50+ lines of KDA/match stats)
+    and format them into a clean, compact entry. Any field missing from
+    a particular block just shows "N/A" instead of breaking the import -
+    dumps are never perfectly uniform between scrapes.
+    """
+    lines = block.splitlines()
+    first_line = lines[0].strip() if lines else ""
+    if ":" in first_line:
+        email, _, password = first_line.partition(":")
+    else:
+        email, password = first_line, ""
+
+    def field(label: str) -> str:
+        match = re.search(rf"^\s*{re.escape(label)}:\s*(.+)$", block, re.MULTILINE)
+        return match.group(1).strip() if match else "N/A"
+
+    lines_out = [f"📧 Gmail: {email.strip()}", f"🔑 Password: {password.strip()}"]
+    for label, emoji in SMART_FIELDS:
+        lines_out.append(f"{emoji} {label}: {field(label)}")
+    return "\n".join(lines_out)
 
 
 # ==============================================================================
@@ -704,7 +747,7 @@ async def unlock_discount_callback(update: Update, context: ContextTypes.DEFAULT
 # ==============================================================================
 STOCK_HELP_TEXT = (
     "🛠 Vinzy Shop - Stock Group Commands\n\n"
-    "/addstock <quantity> - Start a stock drop (bot will ask you to paste the accounts)\n"
+    "/addstock - Start a stock drop (bot asks for a product, then a .txt file of accounts)\n"
     "/setprice <code> <price> - Change a product's price\n"
     "/productprice <code> <price> - Same as /setprice\n"
     "/addproduct <code> <price> <name...> - Create a new product\n"
@@ -1284,21 +1327,23 @@ async def stat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ==============================================================================
-# Stock-group: /addstock conversation (multi-quantity stock drop)
+# Stock-group: /addstock conversation (file-driven, smart field extraction)
 # ==============================================================================
+# Flow: /addstock -> pick a product (auto-skipped if there's only one) ->
+# bot asks you to send a .txt FILE (no more pasting huge blocks of text)
+# -> bot downloads it, splits it into individual accounts the same way as
+# before (separated by --- lines), then runs each one through
+# smart_extract_account() to keep only the fields that matter (Gmail,
+# Password, ID, Name, Level, Hero Count, Skin Count, Banned, V2L Status,
+# Collector Title) instead of storing the entire 50+ line raw dump ->
+# bot tells you how many it found and asks how many to actually add ->
+# inserts that many into the chosen product's stock.
 async def addstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.effective_chat.id != STOCK_GROUP_ID:
         return ConversationHandler.END
     if not await is_group_admin(context, STOCK_GROUP_ID, update.effective_user.id):
         await update.message.reply_text("Only group admins can add stock.")
         return ConversationHandler.END
-
-    quantity = None
-    if context.args:
-        try:
-            quantity = int(context.args[0])
-        except ValueError:
-            quantity = None
 
     async with db_pool.acquire() as conn:
         products = await conn.fetch("SELECT code, name FROM products ORDER BY code")
@@ -1307,19 +1352,17 @@ async def addstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await update.message.reply_text("⚠️ No products exist yet. Use /addproduct first.")
         return ConversationHandler.END
 
-    context.user_data["addstock_quantity"] = quantity
-    context.user_data["addstock_added"] = 0
-
     if len(products) == 1:
-        context.user_data["addstock_product"] = products[0]["code"]
-        qty_note = f" (target: {quantity})" if quantity else ""
+        context.user_data["addstock_product_code"] = products[0]["code"]
+        context.user_data["addstock_product_name"] = products[0]["name"]
         await update.message.reply_text(
-            f"📦 Adding stock to '{products[0]['name']}'{qty_note}.\n\n"
-            f"Paste the accounts now, separated by a line of --- between each one. "
-            f"You can send multiple messages if it's long. Send /done when finished, "
-            f"or /cancel to abort."
+            f"📦 Adding stock to '{products[0]['name']}'.\n\n"
+            f"📄 Send me the .txt file with the accounts now. I'll automatically pull out "
+            f"the Gmail, Password, ID, Name, Level, Hero Count, Skin Count, Banned, "
+            f"V2L Status, and Collector Title from each one.\n\n"
+            f"Send /cancel to abort."
         )
-        return ASK_STOCK_DUMP
+        return ASK_STOCK_FILE
 
     buttons = [[InlineKeyboardButton(p["name"], callback_data=f"addstock_pick_{p['code']}")] for p in products]
     await update.message.reply_text("Which product is this stock for?", reply_markup=InlineKeyboardMarkup(buttons))
@@ -1330,92 +1373,30 @@ async def addstock_pick_product(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     code = query.data.split("addstock_pick_", 1)[1]
-    context.user_data["addstock_product"] = code
 
-    quantity = context.user_data.get("addstock_quantity")
-    qty_note = f" (target: {quantity})" if quantity else ""
+    async with db_pool.acquire() as conn:
+        product = await conn.fetchrow("SELECT name FROM products WHERE code = $1", code)
+    name = product["name"] if product else code
+
+    context.user_data["addstock_product_code"] = code
+    context.user_data["addstock_product_name"] = name
+
     await query.edit_message_text(
-        f"📦 Adding stock to '{code}'{qty_note}.\n\n"
-        f"Paste the accounts now, separated by a line of --- between each one. "
-        f"You can send multiple messages if it's long. Send /done when finished, "
-        f"or /cancel to abort."
+        f"📦 Adding stock to '{name}'.\n\n"
+        f"📄 Send me the .txt file with the accounts now. I'll automatically pull out "
+        f"the Gmail, Password, ID, Name, Level, Hero Count, Skin Count, Banned, "
+        f"V2L Status, and Collector Title from each one.\n\n"
+        f"Send /cancel to abort."
     )
-    return ASK_STOCK_DUMP
+    return ASK_STOCK_FILE
 
 
-async def addstock_receive_dump(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    code = context.user_data.get("addstock_product")
-    text = update.message.text or ""
-    entries = parse_stock_dump(text)
-
-    if not entries:
-        await update.message.reply_text("⚠️ I couldn't find any accounts in that message. Try again, or /done to finish.")
-        return ASK_STOCK_DUMP
-
-    try:
-        async with db_pool.acquire() as conn:
-            await conn.executemany(
-                "INSERT INTO stock (product_code, credentials) VALUES ($1, $2)",
-                [(code, entry) for entry in entries],
-            )
-    except Exception:
-        logger.exception("Failed to insert stock for product %s", code)
-        await update.message.reply_text("⚠️ Something went wrong saving that batch. Please try again.")
-        return ASK_STOCK_DUMP
-
-    context.user_data["addstock_added"] = context.user_data.get("addstock_added", 0) + len(entries)
-    in_stock = await get_stock_count(code)
-    await update.message.reply_text(
-        f"✅ Added {len(entries)} account(s) just now "
-        f"(total this session: {context.user_data['addstock_added']}).\n"
-        f"📦 Now in stock: {in_stock}\n\n"
-        f"Paste more, send /done when finished, or /cancel to abort."
-    )
-    return ASK_STOCK_DUMP
-
-
-async def addstock_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    code = context.user_data.get("addstock_product")
-    added = context.user_data.get("addstock_added", 0)
-    quantity = context.user_data.get("addstock_quantity")
-    in_stock = await get_stock_count(code) if code else 0
-
-    summary = f"✅ Stock drop finished. Added {added} account(s) to '{code}'.\n📦 Now in stock: {in_stock}"
-    if quantity and added != quantity:
-        summary += f"\n⚠️ Note: you asked for {quantity} but {added} were actually added."
-
-    await update.message.reply_text(summary)
-    context.user_data.pop("addstock_quantity", None)
-    context.user_data.pop("addstock_added", None)
-    context.user_data.pop("addstock_product", None)
-    return ConversationHandler.END
-
-
-async def addstock_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.pop("addstock_quantity", None)
-    context.user_data.pop("addstock_added", None)
-    context.user_data.pop("addstock_product", None)
-    await update.message.reply_text("❎ Stock drop cancelled.")
-    return ConversationHandler.END
-
-
-# ==============================================================================
-# Stock-group: file-upload stock import (drop a .txt instead of pasting text)
-# ==============================================================================
-# Same idea as /addstock, but for when you have the accounts saved as a
-# file instead of wanting to paste a huge block of text by hand. Send the
-# .txt straight into the stock group - the bot downloads it, counts how
-# many accounts it can find (using the same --- separated parser as
-# /addstock), then asks how many of them to actually add and to which
-# product before touching the database.
-async def handle_stock_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.effective_chat.id != STOCK_GROUP_ID:
-        return ConversationHandler.END
-    if not await is_group_admin(context, STOCK_GROUP_ID, update.effective_user.id):
-        await update.message.reply_text("Only group admins can import stock files.")
-        return ConversationHandler.END
-
+async def addstock_receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     document = update.message.document
+    if not document:
+        await update.message.reply_text("⚠️ Please send the accounts as a .txt file, or /cancel to abort.")
+        return ASK_STOCK_FILE
+
     try:
         tg_file = await document.get_file()
         buf = BytesIO()
@@ -1424,28 +1405,33 @@ async def handle_stock_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         text = buf.read().decode("utf-8", errors="replace")
     except Exception:
         logger.exception("Failed to download/decode stock file %s", document.file_name)
-        await update.message.reply_text("⚠️ I couldn't read that file. Please make sure it's a plain .txt file and try again.")
-        return ConversationHandler.END
+        await update.message.reply_text(
+            "⚠️ I couldn't read that file. Please make sure it's a plain .txt file and try again, "
+            "or /cancel to abort."
+        )
+        return ASK_STOCK_FILE
 
-    entries = parse_stock_dump(text)
-    if not entries:
+    raw_entries = parse_stock_dump(text)
+    if not raw_entries:
         await update.message.reply_text(
             "⚠️ I couldn't find any accounts in that file. Make sure entries are separated "
-            "by a line of --- between each one."
+            "by a line of --- between each one, then send it again, or /cancel to abort."
         )
-        return ConversationHandler.END
+        return ASK_STOCK_FILE
 
-    context.user_data["file_stock_entries"] = entries
+    smart_entries = [smart_extract_account(block) for block in raw_entries]
+    context.user_data["addstock_entries"] = smart_entries
+
     await update.message.reply_text(
-        f"📄 Found {len(entries)} account(s) in '{document.file_name}'.\n\n"
-        f"How many do you want to add? Send a number (1-{len(entries)}), or 'all'.\n"
+        f"📄 Found {len(smart_entries)} account(s) in '{document.file_name}'.\n\n"
+        f"How many do you want to add? Send a number (1-{len(smart_entries)}), or 'all'.\n"
         f"Send /cancel to abort."
     )
-    return FILE_ASK_QUANTITY
+    return ASK_STOCK_QUANTITY
 
 
-async def file_ask_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    entries = context.user_data.get("file_stock_entries", [])
+async def addstock_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    entries = context.user_data.get("addstock_entries", [])
     if not entries:
         await update.message.reply_text("⚠️ Something went wrong - please send the file again.")
         return ConversationHandler.END
@@ -1458,48 +1444,14 @@ async def file_ask_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             quantity = int(raw)
         except ValueError:
             await update.message.reply_text(f"⚠️ Send a number between 1 and {len(entries)}, or 'all'.")
-            return FILE_ASK_QUANTITY
+            return ASK_STOCK_QUANTITY
 
     if quantity < 1 or quantity > len(entries):
         await update.message.reply_text(f"⚠️ Send a number between 1 and {len(entries)}, or 'all'.")
-        return FILE_ASK_QUANTITY
+        return ASK_STOCK_QUANTITY
 
-    context.user_data["file_stock_quantity"] = quantity
-
-    async with db_pool.acquire() as conn:
-        products = await conn.fetch("SELECT code, name FROM products ORDER BY code")
-
-    if not products:
-        await update.message.reply_text("⚠️ No products exist yet. Use /addproduct first, then send the file again.")
-        context.user_data.pop("file_stock_entries", None)
-        context.user_data.pop("file_stock_quantity", None)
-        return ConversationHandler.END
-
-    if len(products) == 1:
-        return await _finish_file_import(update, context, products[0]["code"], products[0]["name"])
-
-    buttons = [[InlineKeyboardButton(p["name"], callback_data=f"fileprod_{p['code']}")] for p in products]
-    await update.message.reply_text("Which product is this stock for?", reply_markup=InlineKeyboardMarkup(buttons))
-    return FILE_ASK_PRODUCT
-
-
-async def file_pick_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    code = query.data.split("fileprod_", 1)[1]
-
-    async with db_pool.acquire() as conn:
-        product = await conn.fetchrow("SELECT name FROM products WHERE code = $1", code)
-    name = product["name"] if product else code
-
-    return await _finish_file_import(update, context, code, name, via_callback=True)
-
-
-async def _finish_file_import(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, code: str, name: str, via_callback: bool = False
-) -> int:
-    entries = context.user_data.get("file_stock_entries", [])
-    quantity = context.user_data.get("file_stock_quantity", len(entries))
+    code = context.user_data.get("addstock_product_code")
+    name = context.user_data.get("addstock_product_name", code)
     batch = entries[:quantity]
     leftover = len(entries) - len(batch)
 
@@ -1510,34 +1462,31 @@ async def _finish_file_import(
                 [(code, entry) for entry in batch],
             )
     except Exception:
-        logger.exception("Failed to import stock file batch for product %s", code)
-        text = "⚠️ Something went wrong saving that batch. Please try again."
-        if via_callback:
-            await update.callback_query.edit_message_text(text)
-        else:
-            await update.message.reply_text(text)
-        return ConversationHandler.END
+        logger.exception("Failed to insert stock for product %s", code)
+        await update.message.reply_text("⚠️ Something went wrong saving that batch. Please try again.")
+        return ASK_STOCK_QUANTITY
 
     in_stock = await get_stock_count(code)
     summary = f"✅ Added {len(batch)} account(s) to '{name}'.\n📦 Now in stock: {in_stock}"
     if leftover > 0:
-        summary += f"\n\nℹ️ {leftover} account(s) from the file were left over (not added). Send the file again to add the rest."
+        summary += f"\n\nℹ️ {leftover} account(s) from the file were left over (not added)."
 
-    if via_callback:
-        await update.callback_query.edit_message_text(summary)
-    else:
-        await update.message.reply_text(summary)
+    await update.message.reply_text(summary)
 
-    context.user_data.pop("file_stock_entries", None)
-    context.user_data.pop("file_stock_quantity", None)
+    context.user_data.pop("addstock_entries", None)
+    context.user_data.pop("addstock_product_code", None)
+    context.user_data.pop("addstock_product_name", None)
     return ConversationHandler.END
 
 
-async def file_import_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.pop("file_stock_entries", None)
-    context.user_data.pop("file_stock_quantity", None)
-    await update.message.reply_text("❎ File import cancelled. Nothing was added.")
+async def addstock_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("addstock_entries", None)
+    context.user_data.pop("addstock_product_code", None)
+    context.user_data.pop("addstock_product_name", None)
+    await update.message.reply_text("❎ Stock drop cancelled. Nothing was added.")
     return ConversationHandler.END
+
+
 
 
 # ==============================================================================
@@ -1873,10 +1822,8 @@ def build_application() -> Application:
         entry_points=[CommandHandler("addstock", addstock_cmd, filters=stock_chat)],
         states={
             ASK_STOCK_PRODUCT: [CallbackQueryHandler(addstock_pick_product, pattern="^addstock_pick_")],
-            ASK_STOCK_DUMP: [
-                CommandHandler("done", addstock_done, filters=stock_chat),
-                MessageHandler(stock_chat & filters.TEXT & ~filters.COMMAND, addstock_receive_dump),
-            ],
+            ASK_STOCK_FILE: [MessageHandler(stock_chat & filters.Document.ALL, addstock_receive_file)],
+            ASK_STOCK_QUANTITY: [MessageHandler(stock_chat & filters.TEXT & ~filters.COMMAND, addstock_quantity)],
         },
         fallbacks=[CommandHandler("cancel", addstock_cancel, filters=stock_chat)],
     )
