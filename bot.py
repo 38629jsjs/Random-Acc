@@ -168,6 +168,7 @@ logger = logging.getLogger("vinzy-bot")
 ASK_AMOUNT, ASK_RECEIPT = range(2)                 # Add Funds (customer)
 ASK_STOCK_PRODUCT, ASK_STOCK_FILE, ASK_STOCK_QUANTITY = range(10, 13)  # /addstock (stock group)
 ASK_KHQR_PHOTO = 20                                # /khqr (stock group)
+CLEAR_ASK_PRODUCT, CLEAR_ASK_QUANTITY, CLEAR_CONFIRM = range(40, 43)  # /clearstock (stock group)
 
 db_pool: Optional[asyncpg.Pool] = None
 
@@ -632,9 +633,19 @@ def smart_extract_account(block: str) -> str:
         match = re.search(rf"^\s*{re.escape(label)}:\s*(.+)$", block, re.MULTILINE)
         return match.group(1).strip() if match else "N/A"
 
+    def collector_title() -> str:
+        # Most dumps have it on its own line: "Collector Title: X".
+        match = re.search(r"^\s*Collector Title:\s*(.+)$", block, re.MULTILINE)
+        if match:
+            return match.group(1).strip()
+        # Some dumps embed it instead: "Collector Level: 47750  Title: X".
+        match = re.search(r"Title:\s*(.+)$", block, re.MULTILINE)
+        return match.group(1).strip() if match else "N/A"
+
     lines_out = [f"📧 Gmail: {email.strip()}", f"🔑 Password: {password.strip()}"]
     for label, emoji in SMART_FIELDS:
-        lines_out.append(f"{emoji} {label}: {field(label)}")
+        value = collector_title() if label == "Collector Title" else field(label)
+        lines_out.append(f"{emoji} {label}: {value}")
     return "\n".join(lines_out)
 
 
@@ -748,6 +759,7 @@ async def unlock_discount_callback(update: Update, context: ContextTypes.DEFAULT
 STOCK_HELP_TEXT = (
     "🛠 Vinzy Shop - Stock Group Commands\n\n"
     "/addstock - Start a stock drop (bot asks for a product, then a .txt file of accounts)\n"
+    "/clearstock - Permanently remove stock from a product (asks which product, how many, then confirms)\n"
     "/setprice <code> <price> - Change a product's price\n"
     "/productprice <code> <price> - Same as /setprice\n"
     "/addproduct <code> <price> <name...> - Create a new product\n"
@@ -1487,6 +1499,153 @@ async def addstock_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return ConversationHandler.END
 
 
+# ==============================================================================
+# Stock-group: /clearstock conversation (pick product, pick quantity, confirm)
+# ==============================================================================
+# Deleting stock is permanent, so this always ends with an explicit Yes/No
+# confirmation button before anything actually gets removed from the
+# database - there's no way to accidentally wipe stock with a typo.
+async def clearstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_chat.id != STOCK_GROUP_ID:
+        return ConversationHandler.END
+    if not await is_group_admin(context, STOCK_GROUP_ID, update.effective_user.id):
+        await update.message.reply_text("Only group admins can clear stock.")
+        return ConversationHandler.END
+
+    async with db_pool.acquire() as conn:
+        products = await conn.fetch("SELECT code, name FROM products ORDER BY code")
+
+    if not products:
+        await update.message.reply_text("⚠️ No products exist yet.")
+        return ConversationHandler.END
+
+    if len(products) == 1:
+        return await _clearstock_prompt_quantity(update, context, products[0]["code"], products[0]["name"])
+
+    buttons = [[InlineKeyboardButton(p["name"], callback_data=f"clearstock_pick_{p['code']}")] for p in products]
+    await update.message.reply_text(
+        "Which product do you want to clear stock from?", reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return CLEAR_ASK_PRODUCT
+
+
+async def clearstock_pick_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    code = query.data.split("clearstock_pick_", 1)[1]
+
+    async with db_pool.acquire() as conn:
+        product = await conn.fetchrow("SELECT name FROM products WHERE code = $1", code)
+    name = product["name"] if product else code
+
+    return await _clearstock_prompt_quantity(update, context, code, name, via_callback=True)
+
+
+async def _clearstock_prompt_quantity(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, code: str, name: str, via_callback: bool = False
+) -> int:
+    context.user_data["clearstock_product_code"] = code
+    context.user_data["clearstock_product_name"] = name
+    in_stock = await get_stock_count(code)
+
+    if in_stock == 0:
+        text = f"📦 '{name}' already has 0 accounts in stock - nothing to clear."
+        if via_callback:
+            await update.callback_query.edit_message_text(text)
+        else:
+            await update.message.reply_text(text)
+        return ConversationHandler.END
+
+    text = (
+        f"📦 '{name}' currently has {in_stock} account(s) in stock.\n\n"
+        f"How many do you want to permanently remove? Send a number (1-{in_stock}), or 'all'.\n"
+        f"Send /cancel to abort."
+    )
+    if via_callback:
+        await update.callback_query.edit_message_text(text)
+    else:
+        await update.message.reply_text(text)
+    return CLEAR_ASK_QUANTITY
+
+
+async def clearstock_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    code = context.user_data.get("clearstock_product_code")
+    name = context.user_data.get("clearstock_product_name", code)
+    in_stock = await get_stock_count(code)
+
+    raw = update.message.text.strip().lower()
+    if raw == "all":
+        quantity = in_stock
+    else:
+        try:
+            quantity = int(raw)
+        except ValueError:
+            await update.message.reply_text(f"⚠️ Send a number between 1 and {in_stock}, or 'all'.")
+            return CLEAR_ASK_QUANTITY
+
+    if quantity < 1 or quantity > in_stock:
+        await update.message.reply_text(f"⚠️ Send a number between 1 and {in_stock}, or 'all'.")
+        return CLEAR_ASK_QUANTITY
+
+    context.user_data["clearstock_quantity"] = quantity
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Yes, delete them", callback_data="clearstock_confirm_yes"),
+                InlineKeyboardButton("❌ No, cancel", callback_data="clearstock_confirm_no"),
+            ]
+        ]
+    )
+    await update.message.reply_text(
+        f"⚠️ This will permanently delete {quantity} account(s) from '{name}'. This cannot be undone.\n\nConfirm?",
+        reply_markup=keyboard,
+    )
+    return CLEAR_CONFIRM
+
+
+async def clearstock_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    code = context.user_data.get("clearstock_product_code")
+    name = context.user_data.get("clearstock_product_name", code)
+    quantity = context.user_data.get("clearstock_quantity", 0)
+
+    if query.data == "clearstock_confirm_no":
+        await query.edit_message_text("❎ Clear cancelled. Nothing was deleted.")
+    else:
+        try:
+            async with db_pool.acquire() as conn:
+                deleted_rows = await conn.fetch(
+                    """DELETE FROM stock
+                       WHERE id IN (
+                           SELECT id FROM stock WHERE product_code = $1 ORDER BY id ASC LIMIT $2
+                       )
+                       RETURNING id""",
+                    code,
+                    quantity,
+                )
+            remaining = await get_stock_count(code)
+            await query.edit_message_text(
+                f"✅ Deleted {len(deleted_rows)} account(s) from '{name}'.\n📦 Remaining in stock: {remaining}"
+            )
+        except Exception:
+            logger.exception("clearstock_confirm failed for product %s", code)
+            await query.edit_message_text("⚠️ Something went wrong while deleting. Please try again.")
+
+    context.user_data.pop("clearstock_product_code", None)
+    context.user_data.pop("clearstock_product_name", None)
+    context.user_data.pop("clearstock_quantity", None)
+    return ConversationHandler.END
+
+
+async def clearstock_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("clearstock_product_code", None)
+    context.user_data.pop("clearstock_product_name", None)
+    context.user_data.pop("clearstock_quantity", None)
+    await update.message.reply_text("❎ Clear stock cancelled. Nothing was deleted.")
+    return ConversationHandler.END
+
 
 
 # ==============================================================================
@@ -1834,6 +1993,16 @@ def build_application() -> Application:
         fallbacks=[CommandHandler("cancel", khqr_cancel, filters=stock_chat)],
     )
 
+    clearstock_conversation = ConversationHandler(
+        entry_points=[CommandHandler("clearstock", clearstock_cmd, filters=stock_chat)],
+        states={
+            CLEAR_ASK_PRODUCT: [CallbackQueryHandler(clearstock_pick_product, pattern="^clearstock_pick_")],
+            CLEAR_ASK_QUANTITY: [MessageHandler(stock_chat & filters.TEXT & ~filters.COMMAND, clearstock_quantity)],
+            CLEAR_CONFIRM: [CallbackQueryHandler(clearstock_confirm, pattern="^clearstock_confirm_")],
+        },
+        fallbacks=[CommandHandler("cancel", clearstock_cancel, filters=stock_chat)],
+    )
+
     # Order matters: commands and conversations before the catch-all router.
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler(["help", "commands"], help_command))
@@ -1846,6 +2015,7 @@ def build_application() -> Application:
     application.add_handler(add_funds_conversation)
     application.add_handler(addstock_conversation)
     application.add_handler(khqr_conversation)
+    application.add_handler(clearstock_conversation)
     application.add_handler(CommandHandler("cancel", cancel_command))
 
     application.add_handler(CommandHandler("setprice", setprice_cmd))
